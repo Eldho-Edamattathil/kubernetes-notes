@@ -1,0 +1,932 @@
+KUBERNETES NETWORKING — CHAPTER 7
+SERVICES, CLUSTERIP, ENDPOINTSLICES, AND THE SERVICE DATA PLANE
+==========================================================================
+
+Purpose
+-------
+This chapter explains how Kubernetes Services provide stable networking
+for changing Pods. It covers selectors, EndpointSlices, ClusterIP, Service
+DNS, the Service data plane, kube-proxy, DNAT, connection tracking, return
+traffic, Service types, headless Services, and troubleshooting.
+
+
+1. The problem: Pod IP addresses are temporary
+------------------------------------------------
+Assume an application currently has three backend Pods:
+
+  backend-1: 10.244.1.8
+  backend-2: 10.244.2.9
+  backend-3: 10.244.3.7
+
+A client could connect directly to one Pod IP:
+
+  Client -> 10.244.2.9
+
+However, Pods are disposable. If backend-2 is deleted, its replacement may
+receive another address:
+
+  Old Pod: 10.244.2.9
+  New Pod: 10.244.1.15
+
+A client that remembers the old IP can no longer reach the application.
+Clients would also need to discover new replicas, remove failed replicas,
+avoid unready Pods, and distribute connections across the available Pods.
+
+Kubernetes Services solve this discovery and stability problem.
+
+
+2. What is a Kubernetes Service?
+--------------------------------
+A Service is a Kubernetes API object that represents a logical collection
+of network endpoints, usually Pods.
+
+A typical Service provides:
+
+  * a stable name
+  * a stable virtual IP address
+  * a stable service port
+  * discovery of matching Pods
+  * selection among ready backend endpoints
+
+Example:
+
+  Service name: backend
+  ClusterIP:    10.96.20.50
+  Service port: 80
+
+  Backend endpoints:
+    10.244.1.8:8080
+    10.244.2.9:8080
+    10.244.3.7:8080
+
+Clients use:
+
+  10.96.20.50:80
+
+The Service data plane redirects each new tracked flow to an appropriate
+ready backend endpoint. Clients do not need to follow individual Pod IP
+changes.
+
+
+3. Basic Service manifest
+-------------------------
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: backend
+  spec:
+    selector:
+      app: backend
+    ports:
+      - name: http
+        protocol: TCP
+        port: 80
+        targetPort: 8080
+
+This describes:
+
+  Service name:     backend
+  Selector:         app=backend
+  Service port:     80
+  Backend Pod port: 8080
+  Protocol:         TCP
+
+
+4. Service selectors and Pod labels
+-----------------------------------
+The selector:
+
+  selector:
+    app: backend
+
+matches Pods with this label:
+
+  labels:
+    app: backend
+
+Conceptually:
+
+  Service selector: app=backend
+             |
+             +-- Pod 1: app=backend
+             +-- Pod 2: app=backend
+             +-- Pod 3: app=backend
+
+A Pod labelled app=frontend is not selected.
+
+A common Service failure is a small mismatch between the Service selector
+and the Pod labels. In that situation, the Service exists but has no
+backend endpoints.
+
+
+5. Service port versus targetPort
+---------------------------------
+Given:
+
+  ports:
+    - port: 80
+      targetPort: 8080
+
+The meanings are:
+
+  port:
+    The port exposed by the Service. Clients connect to ServiceIP:80.
+
+  targetPort:
+    The port where the backend application listens. Traffic is delivered
+    to PodIP:8080.
+
+Example:
+
+  Client
+    -> 10.96.20.50:80        Service IP and port
+    -> 10.244.2.9:8080       selected Pod IP and target port
+
+The values can be the same, but they do not have to be.
+
+
+6. Named target ports
+---------------------
+A Pod can name its container port:
+
+  containers:
+    - name: application
+      ports:
+        - name: web
+          containerPort: 8080
+
+The Service can refer to that name:
+
+  ports:
+    - port: 80
+      targetPort: web
+
+Kubernetes resolves web to the appropriate port for each endpoint. Named
+ports make the purpose clearer and allow implementations to use a named
+contract instead of requiring the Service to hard-code one backend port
+number.
+
+
+7. EndpointSlices
+-----------------
+The control plane normally creates EndpointSlice objects for Services that
+have selectors.
+
+EndpointSlices store information such as:
+
+  * backend IP addresses
+  * backend ports
+  * readiness/serving/terminating conditions
+  * address family, such as IPv4 or IPv6
+  * the node hosting an endpoint
+  * topology information such as zone
+
+Conceptually:
+
+  Service: backend
+  ClusterIP: 10.96.20.50
+            |
+            v
+  EndpointSlice
+    +-- 10.244.1.8:8080   ready
+    +-- 10.244.2.9:8080   ready
+    +-- 10.244.3.7:8080   ready
+
+EndpointSlices are updated when matching Pods appear, disappear, change
+readiness, or terminate. They allow Kubernetes to distribute backend
+information efficiently at scale.
+
+Useful commands:
+
+  kubectl get services
+  kubectl get endpointslices
+  kubectl describe service backend
+  kubectl get endpointslices \
+    -l kubernetes.io/service-name=backend
+
+
+8. Readiness and endpoint eligibility
+-------------------------------------
+Suppose a Pod has matching labels but its readiness probe fails:
+
+  Pod exists:   yes
+  Labels match: yes
+  Ready:        no
+
+That Pod is normally not treated as a ready backend for ordinary new
+Service traffic. This protects clients from Pods that are starting,
+temporarily unhealthy, or shutting down.
+
+EndpointSlices include ready, serving, and terminating conditions. Exact
+handling during termination can depend on the endpoint conditions, traffic
+policy, and implementation, but the core idea is that endpoint health and
+lifecycle state influence backend eligibility.
+
+
+9. What is a ClusterIP?
+-----------------------
+The default Service type is ClusterIP. Kubernetes allocates an address from
+the configured Service CIDR:
+
+  Service CIDR: 10.96.0.0/12
+  ClusterIP:    10.96.20.50
+
+The ClusterIP normally remains stable for the lifetime of the Service. It
+is generally reachable inside the cluster, unless additional network
+integration exposes or routes it elsewhere.
+
+Important:
+
+  A ClusterIP is normally a virtual IP.
+
+It is not the IP of one particular Pod and is usually not assigned to a
+normal network interface in the same way as a Pod or node IP. Packet-
+processing rules recognize traffic for it and redirect that traffic to
+real endpoints.
+
+
+10. Is a Service a separate proxy server?
+-----------------------------------------
+Usually, no.
+
+Incorrect mental model:
+
+  Client -> Service server process -> Pod
+
+Better mental model:
+
+  Client packet addressed to ServiceIP:port
+        -> kernel Service rules match it
+        -> backend is selected
+        -> destination is rewritten to PodIP:targetPort
+        -> normal routing and CNI delivery continue
+
+A regular ClusterIP Service is primarily:
+
+  * an API object stored by the control plane
+  * endpoint information in EndpointSlices
+  * programmed packet-processing state on cluster nodes
+
+There is normally no application process listening on the ClusterIP and
+copying every packet between the client and backend.
+
+
+11. What is the Service data plane?
+-----------------------------------
+The Service data plane is the packet-processing logic on cluster nodes
+that implements Service forwarding.
+
+It performs these core operations:
+
+  1. Recognizes a destination Service IP, port, and protocol.
+  2. Selects an eligible backend endpoint.
+  3. Rewrites the destination to the selected Pod IP and target port.
+  4. Maintains flow translation state so responses remain consistent.
+  5. Passes the rewritten packet into normal routing/CNI delivery.
+
+It is not normally a separate physical network, Pod, or application-level
+proxy server. It is commonly implemented through kernel networking rules
+or programs.
+
+Short definition:
+
+  The Service data plane is the set of node networking rules/programs that
+  recognizes Service traffic, selects a backend, and redirects the packet
+  to that backend.
+
+
+12. Who creates the Service data plane?
+---------------------------------------
+The standard Kubernetes implementation uses kube-proxy on each node.
+
+kube-proxy watches the Kubernetes control plane for:
+
+  * Service objects
+  * EndpointSlice objects
+
+It then programs the node's kernel networking facilities.
+
+On Linux, kube-proxy can use mechanisms such as:
+
+  * iptables
+  * nftables
+  * IPVS
+
+Some CNIs replace kube-proxy's Service implementation with their own
+service data plane, often using eBPF or other mechanisms.
+
+Relationship:
+
+  Services + EndpointSlices
+             |
+             | watched by
+             v
+  kube-proxy or CNI agent
+             |
+             | programs
+             v
+  kernel rules/programs = Service data plane
+             |
+             | handles actual packets
+             v
+  selected Pod endpoint
+
+kube-proxy usually configures the data plane. The kernel data plane handles
+the packet path; kube-proxy does not usually copy every packet through a
+user-space loop.
+
+
+13. DNAT: translating the destination
+-------------------------------------
+Assume:
+
+  Client Pod:   10.244.1.20
+  Service IP:   10.96.20.50
+  Service port: 80
+  Backend Pod:  10.244.2.9
+  Target port:  8080
+
+The original flow is:
+
+  10.244.1.20:42000 -> 10.96.20.50:80
+
+The Service data plane selects a backend and applies destination NAT:
+
+  10.96.20.50:80 -> 10.244.2.9:8080
+
+The rewritten flow becomes:
+
+  10.244.1.20:42000 -> 10.244.2.9:8080
+
+This operation is DNAT because the destination address and/or destination
+port is changed.
+
+
+14. Short packet flow
+---------------------
+The user's understanding is correct:
+
+  1. A packet is sent toward ServiceIP:servicePort.
+  2. It enters a node's network stack.
+  3. Service data-plane rules recognize the Service tuple.
+  4. A ready backend endpoint is selected.
+  5. DNAT changes ServiceIP:servicePort to PodIP:targetPort.
+  6. The node performs routing using the rewritten Pod IP.
+  7. The CNI delivers the packet locally or across nodes.
+
+Compact responsibility split:
+
+  Service data plane:
+    Choose a backend and perform the Service translation.
+
+  Node routing and CNI:
+    Deliver the rewritten packet to that backend Pod.
+
+
+15. Complete cross-node Service flow
+------------------------------------
+Assume the client is on Node 1 and the chosen backend is on Node 2:
+
+  Client:  10.244.1.20
+  Service: 10.96.20.50:80
+  Backend: 10.244.2.9:8080
+
+Step 1 — Service discovery:
+
+  The client resolves the Service name to 10.96.20.50.
+
+Step 2 — Client creates the flow:
+
+  Source:      10.244.1.20:42000
+  Destination: 10.96.20.50:80
+
+Step 3 — Packet enters node processing:
+
+  It travels through the Pod's CNI path into Node 1's network stack.
+
+Step 4 — Service match:
+
+  The Service data plane matches 10.96.20.50:80/TCP.
+
+Step 5 — Endpoint selection:
+
+  It chooses 10.244.2.9:8080 from the eligible endpoints.
+
+Step 6 — DNAT:
+
+  Destination changes from 10.96.20.50:80 to 10.244.2.9:8080.
+
+Step 7 — Route the rewritten packet:
+
+  Node 1 looks up 10.244.2.9. Direct routing, VXLAN, Geneve, IP-in-IP,
+  eBPF, or another CNI mechanism carries it toward Node 2.
+
+Step 8 — Local delivery:
+
+  Node 2 uses its CNI dataplane to deliver the packet to the backend Pod.
+
+
+16. What the backend Pod sees
+-----------------------------
+For a typical internal ClusterIP flow, the backend sees traffic addressed
+to its own Pod IP and target port:
+
+  Source IP:        10.244.1.20
+  Destination IP:   10.244.2.9
+  Destination port: 8080
+
+The original client source IP is often preserved for internal traffic.
+Exact source-address behavior can vary with proxy mode, CNI, topology,
+traffic policy, and whether additional SNAT is required.
+
+The backend application normally receives the connection on PodIP:targetPort,
+not directly on the Service ClusterIP.
+
+
+17. Connection tracking and the reply
+-------------------------------------
+The backend replies:
+
+  10.244.2.9:8080 -> 10.244.1.20:42000
+
+The node's connection-tracking state remembers that the client originally
+connected to:
+
+  10.96.20.50:80
+
+Reverse translation makes the response appear to the client as part of
+the connection it opened to the Service:
+
+  Client observes source: 10.96.20.50:80
+
+Without consistent reverse translation, the TCP connection would not match
+what the client expects.
+
+
+18. Does every packet choose a different Pod?
+----------------------------------------------
+No. Backend selection is normally maintained for a tracked connection or
+flow.
+
+For example:
+
+  TCP connection 1 -> Pod A
+  TCP connection 2 -> Pod C
+  TCP connection 3 -> Pod B
+
+All packets belonging to connection 1 continue to use Pod A. Splitting
+the packets of one TCP connection across unrelated Pods would break the
+TCP stream.
+
+This is mainly Layer-4 connection distribution. It is not necessarily an
+application-aware HTTP load balancer.
+
+
+19. kube-proxy modes: conceptual view
+-------------------------------------
+iptables mode:
+
+  kube-proxy installs Linux netfilter/iptables rules that match Services,
+  select endpoints, and DNAT traffic.
+
+nftables mode:
+
+  kube-proxy programs the Linux nftables API to implement similar Service
+  forwarding behavior.
+
+IPVS mode:
+
+  kube-proxy uses Linux IP Virtual Server facilities, with supporting
+  networking rules, to represent virtual Services and real backends.
+
+The internal implementation differs, but the stable mental model is:
+
+  Service and EndpointSlice state
+      -> program node data plane
+      -> match Service frontend
+      -> choose endpoint
+      -> translate/forward to endpoint
+
+
+20. Service DNS
+---------------
+Clients normally use a Service name instead of memorizing its ClusterIP.
+
+For a Service named backend in namespace production, the full cluster DNS
+name is commonly:
+
+  backend.production.svc.cluster.local
+
+The cluster domain is configurable; cluster.local is common but not
+mandatory.
+
+From the same namespace, a Pod can often use:
+
+  backend
+
+From another namespace:
+
+  backend.production
+
+For a standard ClusterIP Service, cluster DNS normally returns the
+ClusterIP:
+
+  backend -> 10.96.20.50
+
+
+21. DNS is not the Service load balancer
+----------------------------------------
+For a normal ClusterIP Service:
+
+  DNS:
+    Service name -> ClusterIP
+
+  Service data plane:
+    ClusterIP:port -> selected PodIP:targetPort
+
+DNS normally does not need to return every Pod IP. It provides stable name
+resolution, while the Service data plane selects a backend.
+
+
+22. What happens when Pods change?
+----------------------------------
+Initial endpoints:
+
+  10.244.1.8:8080
+  10.244.2.9:8080
+  10.244.3.7:8080
+
+If 10.244.2.9 disappears and a replacement 10.244.1.15 becomes ready, the
+EndpointSlice state changes to:
+
+  10.244.1.8:8080
+  10.244.1.15:8080
+  10.244.3.7:8080
+
+The Service remains:
+
+  backend -> 10.96.20.50:80
+
+The data plane updates for new flows. An established TCP connection to a
+deleted Pod is not magically transferred, along with its application/TCP
+state, to a replacement Pod; that connection may fail and need retrying.
+
+
+23. Service types
+-----------------
+ClusterIP:
+
+  The default. Provides a stable virtual IP primarily for cluster-internal
+  access.
+
+NodePort:
+
+  Exposes a port through eligible node addresses:
+
+    NodeIP:nodePort -> Service -> Pod
+
+LoadBalancer:
+
+  Requests integration with an external/cloud load balancer when the
+  environment supports it:
+
+    External load balancer -> Service/node path -> Pod
+
+ExternalName:
+
+  Maps the Service name to an external DNS name. It does not use the normal
+  ClusterIP DNAT data path.
+
+
+24. Headless Services
+---------------------
+A headless Service is configured with:
+
+  spec:
+    clusterIP: None
+
+It has no ordinary ClusterIP frontend.
+
+Normal Service:
+
+  DNS name -> ClusterIP -> Service data plane -> selected endpoint
+
+Headless Service:
+
+  DNS name -> endpoint/Pod addresses more directly
+
+Headless Services are useful when clients need direct endpoint discovery,
+such as some stateful databases and clustered applications. The client or
+its library may need to choose and connect to an endpoint.
+
+
+25. Services without selectors
+------------------------------
+A Service does not always require a Pod selector. It can represent:
+
+  * a database outside Kubernetes
+  * manually managed backends
+  * a system being migrated into the cluster
+  * endpoints managed by a custom controller
+
+In such cases, EndpointSlices can be created or managed separately and
+associated with the Service. Clients still gain a Kubernetes Service name,
+even though the backends are not selected automatically from Pods.
+
+
+26. ClusterIP versus Pod IP
+---------------------------
+ClusterIP:
+
+  * represents a stable Service frontend
+  * is normally virtual
+  * usually persists for the Service lifetime
+  * can represent multiple endpoints
+  * is normally returned by DNS for a standard Service
+
+Pod IP:
+
+  * belongs to one Pod network interface
+  * usually exists for that Pod's lifetime
+  * is an actual routing destination
+  * identifies one particular Pod endpoint
+
+Memory rule:
+
+  ClusterIP = stable virtual frontend
+  Pod IP    = real, changeable backend
+
+
+27. Services depend on the CNI Pod network
+-------------------------------------------
+Services do not replace Pod networking.
+
+The Service data plane transforms:
+
+  ServiceIP:port -> PodIP:targetPort
+
+After that, the cluster must still deliver to the selected Pod IP using:
+
+  * local veth/bridge or other local CNI delivery
+  * direct cross-node routing
+  * VXLAN, Geneve, or IP-in-IP overlay
+  * eBPF forwarding
+  * cloud-native Pod networking
+
+Short relationship:
+
+  Service data plane selects the backend.
+  CNI Pod network delivers to the backend.
+
+
+28. Common misunderstandings
+-----------------------------
+"The Service IP belongs to the API server."
+
+  Usually false. The control plane manages Service state, but normal data
+  traffic does not pass through the Kubernetes API server.
+
+"kube-proxy receives and copies every packet in user space."
+
+  Usually false. It commonly programs kernel rules that process packets.
+
+"The ClusterIP is another Pod or physical interface."
+
+  False in the normal virtual-IP model.
+
+"DNS chooses a Pod for a normal ClusterIP Service."
+
+  Usually false. DNS returns the ClusterIP; the Service data plane selects
+  an endpoint.
+
+"A single TCP connection can jump between Pods."
+
+  False. Connection tracking keeps one connection associated with its
+  chosen backend.
+
+"A Service repairs broken Pod networking."
+
+  False. After DNAT, the CNI must still deliver to the selected Pod.
+
+"Service data plane is a separate server."
+
+  Usually false. It is the node's programmed packet-processing logic.
+
+
+29. Practical Deployment and Service example
+---------------------------------------------
+Deployment:
+
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: backend
+  spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app: backend
+    template:
+      metadata:
+        labels:
+          app: backend
+      spec:
+        containers:
+          - name: backend
+            image: nginx
+            ports:
+              - name: http
+                containerPort: 80
+
+Service:
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: backend
+  spec:
+    selector:
+      app: backend
+    ports:
+      - name: http
+        protocol: TCP
+        port: 80
+        targetPort: http
+
+Inspection:
+
+  kubectl get deployment backend
+  kubectl get pods -l app=backend -o wide
+  kubectl get service backend
+  kubectl describe service backend
+  kubectl get endpointslices \
+    -l kubernetes.io/service-name=backend
+
+Test from a client Pod:
+
+  curl http://backend
+
+
+30. Troubleshooting a Service
+------------------------------
+1. Confirm the Service exists:
+
+     kubectl get service backend
+     kubectl describe service backend
+
+   Verify ClusterIP, protocol, port, targetPort, and selector.
+
+2. Test DNS:
+
+     nslookup backend
+     getent hosts backend
+
+   If name resolution fails, test the ClusterIP directly to distinguish a
+   DNS problem from a Service-forwarding problem.
+
+3. Check Pod labels:
+
+     kubectl get pods --show-labels
+     kubectl get pods -l app=backend
+
+4. Inspect EndpointSlices:
+
+     kubectl get endpointslices \
+       -l kubernetes.io/service-name=backend
+
+   Verify expected Pod IPs, readiness, protocol, and ports.
+
+5. Check Pod readiness:
+
+     kubectl get pods
+     kubectl describe pod <pod-name>
+
+6. Confirm the application listens on targetPort:
+
+     ss -lntp
+
+7. Test the Pod endpoint directly from an appropriate debug Pod:
+
+     curl http://<pod-ip>:<target-port>
+
+8. Test the ClusterIP directly:
+
+     curl http://<cluster-ip>:<service-port>
+
+9. If only remote-node endpoints fail, inspect routes, tunnels, overlay
+   ports, MTU, node firewalls, and CNI health.
+
+10. Inspect NetworkPolicy, CNI policy, node firewall, and cloud rules.
+
+11. Check the component implementing Services:
+
+      kubectl -n kube-system get pods -o wide
+
+    This may be kube-proxy or a CNI agent, depending on the cluster.
+
+
+31. Six diagnostic questions for a Service flow
+------------------------------------------------
+1. What name or IP does the client use?
+
+     backend.production.svc.cluster.local -> 10.96.20.50
+
+2. What Service tuple must match?
+
+     10.96.20.50:80/TCP
+
+3. Which ready endpoints currently back the Service?
+
+     10.244.1.8:8080
+     10.244.2.9:8080
+     10.244.3.7:8080
+
+4. Which endpoint was selected for this connection?
+
+     Example: 10.244.2.9:8080
+
+5. How does the node reach that Pod IP?
+
+     Local CNI delivery or cross-node direct route/overlay.
+
+6. How does the response remain consistent?
+
+     Connection tracking reverses the translation so the client observes
+     replies associated with the Service IP and port.
+
+
+32. Complete memory model
+-------------------------
+Control/state path:
+
+  Service selector
+      -> matching Pods
+      -> EndpointSlices
+      -> kube-proxy or CNI agent
+      -> kernel Service data-plane rules/programs
+
+Packet path:
+
+  Service DNS name
+      -> ClusterIP:servicePort
+      -> Service data-plane match
+      -> select ready backend
+      -> DNAT to PodIP:targetPort
+      -> node route and CNI delivery
+      -> backend Pod
+      -> connection-tracked reverse translation
+      -> client
+
+Core responsibility split:
+
+  DNS:
+    Converts the Service name to its stable frontend address.
+
+  Service data plane:
+    Matches the Service, selects a backend, and performs translation.
+
+  Node routing and CNI:
+    Deliver the translated packet to the selected Pod.
+
+  Connection tracking:
+    Keeps the selected flow and reverse translation consistent.
+
+
+33. Final takeaways
+-------------------
+  * Pod IPs can change; a Service provides a stable frontend.
+  * A Service selector identifies Pods through labels.
+  * EndpointSlices record the current backend IPs, ports, and conditions.
+  * port is the Service-facing port; targetPort is the backend port.
+  * A ClusterIP is normally virtual, not an ordinary interface address.
+  * The Service data plane is programmed node packet-processing logic.
+  * kube-proxy or a CNI agent commonly programs that data plane.
+  * DNAT rewrites ServiceIP:port to PodIP:targetPort.
+  * Node routing and the CNI deliver the rewritten packet.
+  * Connection tracking keeps a connection tied to its selected backend
+    and makes the return traffic consistent with the Service connection.
+  * DNS discovers the Service; it does not normally choose the backend for
+    a standard ClusterIP Service.
+  * New connections can be distributed across endpoints, but one existing
+    TCP connection stays with its chosen endpoint.
+  * Headless Services expose endpoints more directly and have no ordinary
+    ClusterIP frontend.
+  * Services still depend on working Pod-to-Pod networking.
+  * Routing and Service reachability do not override NetworkPolicy or
+    firewall decisions.
+
+
+Official references
+-------------------
+Kubernetes Services and networking:
+  https://kubernetes.io/docs/concepts/services-networking/
+
+Service concepts:
+  https://kubernetes.io/docs/concepts/services-networking/service/
+
+Virtual IPs and Service proxies:
+  https://kubernetes.io/docs/reference/networking/virtual-ips/
+
+EndpointSlices:
+  https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/
+
