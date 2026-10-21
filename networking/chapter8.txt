@@ -1,0 +1,1142 @@
+KUBERNETES NETWORKING — CHAPTER 8
+EXTERNAL ACCESS: NODEPORT, LOADBALANCER, INGRESS, TLS, AND GATEWAY API
+===========================================================================
+
+Purpose
+-------
+This chapter explains how clients outside a Kubernetes cluster reach
+applications running in Pods. It covers:
+
+  * NodePort Services
+  * LoadBalancer Services
+  * externalTrafficPolicy
+  * Ingress resources and Ingress controllers
+  * Layer 4 versus Layer 7 routing
+  * TLS termination, re-encryption, and passthrough
+  * Gateway API and HTTPRoute
+  * Gateway listeners, backend ports, and certificates
+  * NGINX and Traefik as Ingress or Gateway implementations
+  * complete packet flows and troubleshooting
+
+
+1. Starting point: ClusterIP is normally internal
+-------------------------------------------------
+Assume this application:
+
+  Node 1 IP: 192.168.1.21
+  Node 2 IP: 192.168.1.22
+
+  Backend Pods:
+    10.244.1.8:8080
+    10.244.2.9:8080
+
+  Service:
+    Name:       backend
+    ClusterIP:  10.96.20.50
+    Port:       80
+    TargetPort: 8080
+
+Inside the cluster, a client can use:
+
+  backend:80
+
+or:
+
+  10.96.20.50:80
+
+The ClusterIP is normally a cluster-internal virtual IP. An external
+computer generally cannot route directly to it.
+
+Common ways to provide external access are:
+
+  * NodePort
+  * LoadBalancer Service
+  * Ingress
+  * Gateway API
+
+
+PART A — NODEPORT
+=================
+
+2. What is a NodePort Service?
+------------------------------
+A NodePort Service exposes a port through eligible Kubernetes node
+addresses.
+
+Example:
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: backend
+  spec:
+    type: NodePort
+    selector:
+      app: backend
+    ports:
+      - protocol: TCP
+        port: 80
+        targetPort: 8080
+        nodePort: 30080
+
+The three ports have different roles:
+
+  nodePort:   External/node-facing port, 30080
+  port:       Service port, 80
+  targetPort: Application port on the Pod, 8080
+
+A client may reach the Service through an eligible node address:
+
+  192.168.1.21:30080
+
+The commonly configured default NodePort allocation range is:
+
+  30000-32767
+
+If nodePort is omitted, Kubernetes normally allocates an available port
+from the cluster's configured NodePort range.
+
+
+3. NodePort packet flow
+-----------------------
+Suppose an external client sends:
+
+  Source:      203.0.113.10:50000
+  Destination: 192.168.1.21:30080
+
+The flow is:
+
+  External client
+       -> Node 1 IP:30080
+       -> NodePort Service data-plane rule
+       -> select a ready endpoint
+       -> DNAT to PodIP:targetPort
+       -> CNI delivers the packet
+       -> backend Pod
+
+Example translation:
+
+  Before DNAT:
+    203.0.113.10:50000 -> 192.168.1.21:30080
+
+  After DNAT:
+    203.0.113.10:50000 -> 10.244.2.9:8080
+
+Source-address translation may also occur depending on the traffic policy
+and implementation.
+
+
+4. Does the Pod need to run on the contacted node?
+---------------------------------------------------
+Not with the usual cluster-wide traffic policy.
+
+A client may contact Node 1 even if the selected Pod is on Node 2:
+
+  Client
+    -> Node 1:30080
+    -> Service data plane chooses Pod on Node 2
+    -> cross-node CNI routing/tunnel
+    -> Node 2
+    -> Pod
+
+NodePort belongs to the Service data plane. It is not permanently bound to
+one local Pod.
+
+
+5. Is a process listening on the NodePort?
+------------------------------------------
+Usually, there is no ordinary application process listening on port 30080.
+kube-proxy or a CNI service implementation programs kernel rules/programs
+that recognize NodeIP:nodePort and redirect the traffic.
+
+NodePort itself is primarily a Layer-4 forwarding mechanism. It normally
+does not inspect HTTP paths or decrypt TLS.
+
+
+6. NodePort limitations
+-----------------------
+  * Clients need a reachable node IP.
+  * Clients usually use a high port.
+  * Node and cloud firewalls must allow that port.
+  * Failed nodes must be removed from external traffic paths.
+  * Exposing many applications consumes multiple NodePorts.
+  * DNS and TLS lifecycle are not automatically provided by NodePort.
+  * NodePort address availability depends on proxy configuration.
+
+NodePort is still useful for labs, development, bare-metal integrations,
+and as a building block behind some external load balancers.
+
+
+PART B — LOADBALANCER SERVICES
+==============================
+
+7. What is a LoadBalancer Service?
+----------------------------------
+A LoadBalancer Service requests an externally reachable load balancer from
+a supported infrastructure integration.
+
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: backend
+  spec:
+    type: LoadBalancer
+    selector:
+      app: backend
+    ports:
+      - port: 80
+        targetPort: 8080
+
+The environment may assign:
+
+  External address: 198.51.100.25
+  Service port:      80
+
+Clients then use:
+
+  198.51.100.25:80
+
+
+8. Who creates the load balancer?
+---------------------------------
+Kubernetes does not manufacture a physical load balancer. A controller or
+infrastructure integration observes the Service and configures something
+such as:
+
+  * a cloud load balancer
+  * a software load balancer
+  * a bare-metal load-balancer implementation
+  * a network appliance
+
+Without a compatible implementation, the external address may remain
+pending.
+
+
+9. Common LoadBalancer packet paths
+-----------------------------------
+Traditional node-based path:
+
+  External client
+       -> external load-balancer IP
+       -> load balancer selects a node
+       -> NodePort or node Service data plane
+       -> backend Pod
+
+Example:
+
+  Client
+       -> 198.51.100.25:80
+       -> 192.168.1.21:30080
+       -> DNAT to 10.244.2.9:8080
+
+Not every implementation uses NodePort internally. Some can route directly
+to Pods or use another provider-native data path.
+
+
+10. Public versus internal load balancers
+-----------------------------------------
+A public load balancer may be reachable from the Internet.
+
+An internal/private load balancer may be reachable only from:
+
+  * the VPC or VNet
+  * a private corporate network
+  * connected VPNs
+  * peered private networks
+
+Requesting an internal load balancer generally requires provider-specific
+configuration.
+
+
+PART C — EXTERNAL TRAFFIC POLICY AND CLIENT IP
+==============================================
+
+11. Why can the original source IP be lost?
+-------------------------------------------
+Assume external traffic reaches Node 1, but the selected Pod is on Node 2:
+
+  External client -> Node 1 -> Node 2 -> Pod
+
+The implementation may apply SNAT at Node 1 to keep the response path
+consistent. The Pod may then see Node 1's IP instead of the external
+client's IP.
+
+
+12. externalTrafficPolicy: Cluster
+----------------------------------
+The cluster-wide policy allows a receiving node to select any ready
+endpoint in the cluster:
+
+  spec:
+    externalTrafficPolicy: Cluster
+
+Flow:
+
+  traffic reaches Node 1
+       -> endpoint may be on Node 1, Node 2, or another node
+
+Benefits:
+
+  * all ready endpoints can participate
+  * receiving nodes need not have a local endpoint
+  * cluster-wide distribution is easier
+
+Trade-offs:
+
+  * traffic may take an extra cross-node hop
+  * client source IP may be translated depending on the path
+
+
+13. externalTrafficPolicy: Local
+--------------------------------
+The local policy restricts externally received traffic to ready endpoints
+on the receiving node:
+
+  spec:
+    externalTrafficPolicy: Local
+
+Flow:
+
+  traffic reaches Node 1
+       -> only a Node 1-local endpoint is eligible
+
+If Node 1 has no local eligible endpoint, traffic sent there is not
+forwarded to a remote Pod and is dropped.
+
+Benefits:
+
+  * normally preserves the original client IP
+  * avoids an extra node-to-node hop
+
+Trade-offs:
+
+  * external load balancer must avoid nodes without local endpoints
+  * traffic may be uneven when nodes host different numbers of Pods
+  * fewer endpoints are eligible on each node
+
+
+PART D — INGRESS
+================
+
+14. What problem does Ingress solve?
+------------------------------------
+Suppose a cluster has several web applications:
+
+  shop Service
+  payments Service
+  reports Service
+
+Instead of provisioning a separate external load balancer for each one,
+Ingress can provide one shared HTTP/HTTPS entry point:
+
+  shop.example.com      -> shop Service
+  pay.example.com       -> payments Service
+  example.com/reports   -> reports Service
+
+Ingress performs Layer-7 routing based on information such as:
+
+  * HTTP hostname
+  * URL path
+  * HTTP/HTTPS protocol
+
+Ingress is primarily for HTTP and HTTPS. Non-HTTP protocols normally use
+NodePort, LoadBalancer, Gateway API capabilities, or implementation-
+specific mechanisms.
+
+
+15. Ingress resource versus Ingress controller
+----------------------------------------------
+Ingress resource:
+
+  A Kubernetes API object containing the desired HTTP routing rules.
+
+Ingress controller:
+
+  The software that watches Ingress resources and configures an actual
+  reverse proxy or load balancer.
+
+Example resource:
+
+  apiVersion: networking.k8s.io/v1
+  kind: Ingress
+  metadata:
+    name: shop-ingress
+  spec:
+    ingressClassName: nginx
+    rules:
+      - host: shop.example.com
+        http:
+          paths:
+            - path: /
+              pathType: Prefix
+              backend:
+                service:
+                  name: shop-service
+                  port:
+                    number: 80
+
+Meaning:
+
+  requests for shop.example.com
+       -> shop-service:80
+
+Creating an Ingress resource without a compatible Ingress controller
+normally does not create a working data path.
+
+Memory rule:
+
+  Ingress resource   = routing instructions
+  Ingress controller = software implementing those instructions
+
+
+16. Ingress packet flow
+-----------------------
+Assume DNS contains:
+
+  shop.example.com -> 198.51.100.30
+
+Flow:
+
+  External client
+       -> DNS resolves shop.example.com
+       -> external IP or load balancer
+       -> Ingress controller
+       -> inspect hostname and URL path
+       -> select Kubernetes Service
+       -> Service/backend discovery
+       -> backend Pod
+
+Unlike ordinary DNAT-only Service forwarding, an Ingress controller is
+usually a real Layer-7 proxy. It accepts a client connection and creates a
+separate upstream connection to the selected backend.
+
+
+17. Service Layer 4 versus Ingress Layer 7
+------------------------------------------
+Service/NodePort commonly uses Layer-4 data:
+
+  * destination IP
+  * destination port
+  * transport protocol
+
+Ingress understands HTTP Layer-7 data:
+
+  * hostname
+  * URL path
+  * HTTP headers
+  * TLS hostname and configuration
+
+This lets many applications share the same external address and ports 80
+and 443.
+
+
+PART E — TLS
+============
+
+18. What is TLS termination?
+----------------------------
+TLS termination means the HTTPS connection from the client ends at a
+component such as an Ingress controller, Gateway, load balancer, or
+application Pod.
+
+Example at Ingress:
+
+  Client
+       -> HTTPS encrypted connection
+       -> Ingress controller terminates TLS
+       -> decrypts the HTTP request
+       -> reads hostname/path/headers
+       -> forwards to backend
+
+The component terminating TLS needs access to the relevant certificate and
+private key.
+
+
+19. TLS termination with plain HTTP upstream
+--------------------------------------------
+  Client --HTTPS--> Ingress/Gateway --HTTP--> Service/Pod
+
+The edge component decrypts the client request and forwards unencrypted
+HTTP inside the cluster.
+
+Benefits:
+
+  * simpler backend configuration
+  * centralized certificate handling
+  * lower TLS workload on application Pods
+
+Trade-off:
+
+  Traffic between the proxy and backend is not encrypted.
+
+
+20. TLS termination followed by re-encryption
+----------------------------------------------
+  Client --HTTPS--> Ingress/Gateway --HTTPS--> Service/Pod
+
+There are two separate TLS sessions:
+
+  TLS session 1: client <-> Ingress/Gateway
+  TLS session 2: Ingress/Gateway <-> backend
+
+The proxy decrypts the client connection, makes its routing decision, then
+creates a new encrypted connection to the backend. The backend may present
+its own certificate, which the proxy should verify when correctly
+configured.
+
+
+21. TLS passthrough
+-------------------
+  Client -------- encrypted TLS --------> backend
+             intermediary forwards TCP
+
+The intermediary does not possess/use the server private key to decrypt
+the HTTP request. It cannot inspect the encrypted HTTP URL path or headers.
+It may be able to route using the TLS SNI hostname visible during the
+handshake, depending on protocol, configuration, and implementation.
+
+
+22. Where can TLS terminate?
+----------------------------
+Ingress controller:
+
+  Commonly terminates TLS and performs HTTP routing. Some implementations
+  can also provide passthrough.
+
+External load balancer:
+
+  May terminate TLS, terminate and re-encrypt, or simply forward the TCP
+  connection. Behavior depends on load-balancer type and configuration.
+
+NodePort:
+
+  Normally does not terminate TLS. It forwards Layer-4 traffic. If HTTPS
+  passes through a NodePort, TLS terminates later at an Ingress controller,
+  Gateway, or application Pod.
+
+Application Pod:
+
+  Can terminate TLS when encrypted traffic is delivered directly to it.
+
+Memory question:
+
+  Which component accepts the TLS connection and has access to the
+  certificate/private key?
+
+That component is the TLS termination point.
+
+
+PART F — GATEWAY API
+====================
+
+23. Gateway API in simple terms
+-------------------------------
+Gateway API is a structured family of Kubernetes extension APIs for
+configuring traffic entry and routing.
+
+Building analogy:
+
+  GatewayClass = type/provider that can build the entrance
+  Gateway      = actual entrance and listening doors
+  HTTPRoute    = directions posted at the entrance
+  Service      = department inside the building
+  Pods         = workers implementing the department
+
+Basic flow:
+
+  Client
+       -> Gateway listener
+       -> HTTPRoute rule
+       -> Service
+       -> Pod
+
+
+24. GatewayClass
+----------------
+A GatewayClass identifies the controller responsible for implementing
+Gateways of that class.
+
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: GatewayClass
+  metadata:
+    name: example-class
+  spec:
+    controllerName: example.com/gateway-controller
+
+It answers:
+
+  Which controller/implementation manages this kind of Gateway?
+
+GatewayClass is usually managed by a cluster administrator or
+infrastructure team.
+
+
+25. Gateway
+-----------
+A Gateway defines an actual traffic-handling entry point and its listeners.
+
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: Gateway
+  metadata:
+    name: public-gateway
+  spec:
+    gatewayClassName: example-class
+    listeners:
+      - name: http
+        protocol: HTTP
+        port: 80
+
+Depending on the implementation, the Gateway may represent:
+
+  * a cloud load balancer
+  * an in-cluster proxy
+  * a network appliance
+  * another controller-managed frontend
+
+
+26. HTTPRoute
+-------------
+HTTPRoute contains application-layer routing rules and attaches them to a
+Gateway.
+
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+    name: shop-route
+  spec:
+    parentRefs:
+      - name: public-gateway
+    hostnames:
+      - shop.example.com
+    rules:
+      - backendRefs:
+          - name: shop-service
+            port: 80
+
+Meaning:
+
+  requests for shop.example.com
+       -> public-gateway
+       -> shop-route
+       -> shop-service:80
+
+
+27. HTTPS still uses HTTPRoute
+------------------------------
+There is no separate HTTPSRoute for ordinary HTTPS routing.
+
+HTTPS means HTTP carried inside TLS:
+
+  HTTPS = HTTP over TLS
+
+When the Gateway terminates TLS:
+
+  Client --HTTPS--> Gateway
+       -> Gateway decrypts TLS
+       -> recovered HTTP request is evaluated by HTTPRoute
+       -> selected Service
+
+HTTPRoute can then match the hostname, path, headers, and other supported
+HTTP properties.
+
+
+28. Gateway listener port versus HTTPRoute backend port
+-------------------------------------------------------
+These ports are for different connections.
+
+Gateway listener:
+
+  listeners:
+    - protocol: HTTPS
+      port: 443
+
+This is where clients enter:
+
+  Client -> Gateway:443
+
+HTTPRoute backend reference:
+
+  backendRefs:
+    - name: shop-service
+      port: 80
+
+This is where the Gateway forwards upstream:
+
+  Gateway -> shop-service:80
+
+The Service may then use targetPort 8080:
+
+  shop-service:80 -> Pod:8080
+
+Memory rule:
+
+  Gateway listener port  = client-facing entry port
+  HTTPRoute backend port = Kubernetes Service port
+  Service targetPort     = application port on the Pod
+
+
+29. HTTPS Gateway and certificate Secret
+----------------------------------------
+An HTTPS listener usually references a Kubernetes TLS Secret:
+
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: Gateway
+  metadata:
+    name: public-gateway
+  spec:
+    gatewayClassName: example-class
+    listeners:
+      - name: https
+        protocol: HTTPS
+        port: 443
+        hostname: shop.example.com
+        tls:
+          mode: Terminate
+          certificateRefs:
+            - kind: Secret
+              name: shop-tls
+
+The certificate is not normally written directly into the Gateway. It is
+stored in a Secret:
+
+  apiVersion: v1
+  kind: Secret
+  metadata:
+    name: shop-tls
+  type: kubernetes.io/tls
+  data:
+    tls.crt: <base64-certificate>
+    tls.key: <base64-private-key>
+
+Relationship:
+
+  Gateway HTTPS listener
+       -> references TLS Secret
+       -> certificate + private key
+
+The Secret is commonly in the same namespace. Cross-namespace references
+require the applicable Gateway API permission/reference mechanisms and
+implementation support.
+
+
+30. Complete HTTPS Gateway and HTTPRoute example
+------------------------------------------------
+Gateway:
+
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: Gateway
+  metadata:
+    name: public-gateway
+  spec:
+    gatewayClassName: example-class
+    listeners:
+      - name: https
+        protocol: HTTPS
+        port: 443
+        hostname: shop.example.com
+        tls:
+          mode: Terminate
+          certificateRefs:
+            - name: shop-tls
+
+HTTPRoute:
+
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+    name: shop-route
+  spec:
+    parentRefs:
+      - name: public-gateway
+        sectionName: https
+    hostnames:
+      - shop.example.com
+    rules:
+      - matches:
+          - path:
+              type: PathPrefix
+              value: /products
+        backendRefs:
+          - name: shop-service
+            port: 80
+
+Traffic flow:
+
+  https://shop.example.com/products
+       -> public-gateway:443
+       -> use shop-tls and terminate TLS
+       -> shop-route matches /products
+       -> shop-service:80
+       -> Service targetPort
+       -> Pod
+
+
+31. Path-based routing example
+------------------------------
+Requirement:
+
+  example.com/shop -> shop-service
+  example.com/api  -> api-service
+
+  apiVersion: gateway.networking.k8s.io/v1
+  kind: HTTPRoute
+  metadata:
+    name: application-routes
+  spec:
+    parentRefs:
+      - name: public-gateway
+    hostnames:
+      - example.com
+    rules:
+      - matches:
+          - path:
+              type: PathPrefix
+              value: /shop
+        backendRefs:
+          - name: shop-service
+            port: 80
+      - matches:
+          - path:
+              type: PathPrefix
+              value: /api
+        backendRefs:
+          - name: api-service
+            port: 80
+
+
+32. Weighted traffic splitting
+------------------------------
+Gateway API can express weighted backend distribution:
+
+  backendRefs:
+    - name: application-v1
+      port: 80
+      weight: 90
+    - name: application-v2
+      port: 80
+      weight: 10
+
+Conceptually:
+
+  approximately 90% -> application-v1
+  approximately 10% -> application-v2
+
+This can support a canary rollout. Exact distribution behavior depends on
+the controller and traffic volume.
+
+
+33. Gateway API versus Ingress API
+----------------------------------
+Ingress commonly combines routing concerns into one resource and has
+historically relied on controller-specific annotations for advanced
+features.
+
+Gateway API separates roles:
+
+  GatewayClass:
+    Which implementation/controller manages the infrastructure?
+
+  Gateway:
+    Where and on which protocol/hostname/port does traffic enter?
+
+  HTTPRoute:
+    How are HTTP requests matched and where are they sent?
+
+  Service:
+    Which stable backend frontend is used?
+
+This supports separation between:
+
+  Infrastructure provider -> controller implementation
+  Cluster operator         -> GatewayClass/Gateway
+  Application developer    -> routes and Services
+
+
+34. Can NGINX or Traefik implement both APIs?
+------------------------------------------------
+Yes, if the installed controller distribution and configuration support
+both APIs.
+
+Using an Ingress API implementation:
+
+  Ingress resource
+       -> watched by NGINX/Traefik Ingress controller
+       -> configures proxy
+       -> Service
+
+Using a Gateway API implementation:
+
+  GatewayClass + Gateway + HTTPRoute
+       -> watched by NGINX/Traefik Gateway controller
+       -> configures proxy
+       -> Service
+
+The underlying proxy technology may be the same. The API objects and
+configuration model differ.
+
+Important qualification:
+
+  Installing a product named "NGINX Ingress Controller" does not
+  automatically guarantee Gateway API support.
+
+Gateway API use normally requires:
+
+  * Gateway API CRDs installed
+  * a controller that supports Gateway API
+  * a GatewayClass referencing that controller
+  * a Gateway
+  * attached routes such as HTTPRoute
+
+
+35. Gateway API does not replace Services
+-----------------------------------------
+Gateway API provides traffic entry and protocol-aware routing. Services
+still provide stable backend identity and Pod endpoint selection.
+
+  Client
+       -> Gateway
+       -> HTTPRoute
+       -> Service
+       -> EndpointSlice/backend selection
+       -> Pod
+
+The CNI network still delivers traffic to the selected Pod.
+
+
+PART G — COMPARISON
+===================
+
+36. ClusterIP
+-------------
+  Address:  Service virtual IP
+  Layer:    primarily Layer 4
+  Clients:  normally internal
+  Use:      internal application-to-application traffic
+
+
+37. NodePort
+------------
+  Address:  NodeIP:highPort
+  Layer:    primarily Layer 4
+  Clients:  external or internal with node reachability
+  Use:      simple exposure or load-balancer integration
+
+
+38. LoadBalancer
+----------------
+  Address:  externally provided IP or hostname
+  Layer:    often Layer 4, provider-dependent
+  Clients:  external private networks or Internet
+  Use:      dedicated external exposure for a Service
+
+
+39. Ingress
+-----------
+  Address:  shared HTTP/HTTPS entry point
+  Layer:    Layer 7
+  Clients:  external web clients
+  Use:      hostname/path routing to multiple Services
+
+
+40. Gateway API
+---------------
+  Address:  Gateway listeners
+  Layer:    protocol/route dependent, including Layer 7 HTTP
+  Clients:  external or internal depending on Gateway
+  Use:      structured, extensible, role-oriented traffic routing
+
+
+41. Quick comparison table
+--------------------------
+  ClusterIP:
+    Internal virtual Service IP; stable access to Pods.
+
+  NodePort:
+    Node IP plus a high port; basic Layer-4 exposure.
+
+  LoadBalancer:
+    Infrastructure-provided external frontend for a Service.
+
+  Ingress:
+    HTTP/HTTPS routing resource implemented by an Ingress controller.
+
+  Gateway API:
+    GatewayClass + Gateway + Route resources implemented by a Gateway
+    controller; richer separation and routing model.
+
+
+PART H — TROUBLESHOOTING
+========================
+
+42. NodePort troubleshooting
+----------------------------
+  kubectl get service backend
+  kubectl describe service backend
+
+Verify:
+
+  * type is NodePort
+  * nodePort is allocated
+  * protocol and ports are correct
+  * ready endpoints exist
+  * the node IP is reachable
+  * node/cloud firewalls permit the port
+  * kube-proxy or the CNI Service implementation is healthy
+  * NodePort is enabled on the address being tested
+
+Test in layers:
+
+  curl http://<pod-ip>:<target-port>
+  curl http://<cluster-ip>:<service-port>
+  curl http://<node-ip>:<node-port>
+
+
+43. LoadBalancer troubleshooting
+--------------------------------
+  kubectl get service backend
+  kubectl describe service backend
+
+Check:
+
+  * external IP or hostname assignment
+  * provisioning events
+  * compatible load-balancer controller/provider integration
+  * health checks and eligible targets
+  * security groups and firewall rules
+  * externalTrafficPolicy
+  * NodePort or direct-Pod path used by the implementation
+
+
+44. Ingress troubleshooting
+----------------------------
+  kubectl get ingress
+  kubectl describe ingress <name>
+  kubectl get ingressclass
+
+Check:
+
+  * compatible Ingress controller is installed and healthy
+  * ingressClassName selects the intended controller
+  * DNS points to the correct external address
+  * hostname and path match the request
+  * referenced Services exist
+  * Services have ready endpoints
+  * TLS Secret exists in the expected namespace
+  * certificate covers the requested hostname
+  * controller can reach backend Services/Pods
+
+
+45. Gateway API troubleshooting
+-------------------------------
+  kubectl get gatewayclass
+  kubectl get gateway
+  kubectl describe gateway <name>
+  kubectl get httproute
+  kubectl describe httproute <name>
+
+Check resource status conditions, especially whether:
+
+  * the GatewayClass is accepted by a running controller
+  * the Gateway is programmed and has an address
+  * the listener is accepted
+  * HTTPRoute is attached to the intended Gateway/listener
+  * hostname rules overlap correctly
+  * cross-namespace references are permitted where used
+  * the certificate Secret exists and is valid
+  * backend Service references and ports are correct
+  * backend Services have ready endpoints
+
+
+46. TLS troubleshooting
+-----------------------
+Check:
+
+  * which component is intended to terminate TLS
+  * where its certificate/private key are stored
+  * certificate hostname/SAN matches the requested hostname
+  * certificate has not expired
+  * Secret uses the expected keys tls.crt and tls.key
+  * TLS mode is terminate, re-encrypt, or passthrough as intended
+  * upstream certificate trust is configured for re-encryption
+  * backend protocol matches configuration (HTTP versus HTTPS)
+
+
+47. Complete memory models
+--------------------------
+NodePort:
+
+  Client
+    -> NodeIP:nodePort
+    -> Service data plane
+    -> DNAT
+    -> CNI
+    -> Pod
+
+LoadBalancer:
+
+  Client
+    -> external load balancer
+    -> node/direct backend path
+    -> Service/Pod
+
+Ingress:
+
+  HTTP client
+    -> shared Ingress entry point
+    -> optional TLS termination
+    -> hostname/path rule
+    -> Service
+    -> Pod
+
+Gateway API:
+
+  Client
+    -> Gateway listener
+    -> optional TLS termination
+    -> HTTPRoute/other Route
+    -> Service
+    -> Pod
+
+
+48. Final takeaways
+-------------------
+  * ClusterIP is normally internal; external access needs another entry
+    mechanism.
+  * NodePort exposes a Service through NodeIP:nodePort.
+  * NodePort normally forwards Layer-4 traffic and does not terminate TLS.
+  * LoadBalancer requests an infrastructure-managed external frontend.
+  * externalTrafficPolicy Cluster can use cluster-wide endpoints.
+  * externalTrafficPolicy Local restricts traffic to node-local endpoints
+    and is commonly used to preserve the client source IP.
+  * Ingress is an HTTP/HTTPS routing API; an Ingress controller implements
+    its rules using a real proxy or load balancer.
+  * TLS termination means the client TLS connection ends at the component
+    holding the certificate/private key.
+  * After termination, upstream traffic can be plain HTTP or newly
+    encrypted HTTPS.
+  * TLS passthrough keeps traffic encrypted until a later component.
+  * Gateway API separates GatewayClass, Gateway, and Route responsibilities.
+  * HTTPS traffic can use HTTPRoute after the Gateway terminates TLS.
+  * Gateway listener port is client-facing; HTTPRoute backend port is the
+    Service port; Service targetPort is the Pod application port.
+  * A Gateway listener references a certificate Secret rather than
+    embedding the certificate directly.
+  * NGINX, Traefik, and similar products may implement Ingress, Gateway API,
+    or both, but support must be confirmed for the installed controller.
+  * Gateway API does not replace Services or the CNI Pod network.
+
+
+Official references
+-------------------
+Kubernetes Services:
+  https://kubernetes.io/docs/concepts/services-networking/service/
+
+Kubernetes Ingress:
+  https://kubernetes.io/docs/concepts/services-networking/ingress/
+
+Kubernetes Gateway API overview:
+  https://kubernetes.io/docs/concepts/services-networking/gateway/
+
+Gateway API documentation:
+  https://gateway-api.sigs.k8s.io/
+
